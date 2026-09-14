@@ -62,6 +62,137 @@ sessions that were previously committed with `add_session_to_memory()`.
 This is the client code proving, not asserting, that memory is genuinely
 decoupled from the active session.
 
+### Deep dive: what actually happens inside `load_memory`
+
+The two code blocks above show *that* memory recall works. This section
+is *how*, traced through ADK's real source
+(`google/adk/tools/load_memory_tool.py` and
+`google/adk/memory/in_memory_memory_service.py`) rather than the framework's
+marketing description of itself — the actual mechanics have real, useful
+gaps to know about.
+
+**The call chain for "what did I quote before?" in a brand-new session:**
+
+```
+LlmAgent sees `load_memory` in root_agent.tools
+        │
+        ▼
+Gemini decides to call load_memory(query="...")   ← model-generated query string
+        │
+        ▼
+LoadMemoryTool.load_memory(query, tool_context)
+        │
+        ▼
+tool_context.search_memory(query)
+        │  (fills in app_name/user_id from the *current* invocation)
+        ▼
+InMemoryMemoryService.search_memory(app_name=..., user_id=..., query=...)
+        │
+        ▼
+returns SearchMemoryResponse(memories=[...])  → back to the model as the tool result
+        │
+        ▼
+Gemini reads the retrieved memories and writes the final answer
+```
+
+**1. The tool secretly rewrites its own instructions every turn.**
+`LoadMemoryTool` overrides `process_llm_request`, which runs on *every*
+model call for as long as the tool is attached:
+
+```python
+async def process_llm_request(self, *, tool_context, llm_request):
+    await super().process_llm_request(...)
+    llm_request.append_instructions(["""
+You have memory. You can use it to answer questions. If any questions need
+you to look up the memory, you should call load_memory function with a query.
+"""])
+```
+
+This is why `pricing_agent/prompts.py` only needs one sentence about
+`load_memory` — the tool injects its own usage instructions into the
+prompt the moment it's included in `tools=[...]`. Worth internalizing as a
+general pattern: some ADK tools ship their own "usage manual" that gets
+silently merged into context, so an agent's *effective* system prompt is
+larger than the string you wrote by hand.
+
+**2. What gets written to memory is raw events, not a summary.**
+
+```python
+async def add_session_to_memory(self, session: Session) -> None:
+    ...
+    self._session_events[user_key][session.id] = [
+        event for event in session.events if event.content and event.content.parts
+    ]
+```
+
+No LLM call, no summarization, no compression — `add_session_to_memory()`
+(called explicitly by `cli_client.py`) just files away every event in the
+session that has content. **ADK's default memory is a raw transcript
+store, not a memory-extraction pipeline.** `VertexAiMemoryBankService`,
+the production swap-in named above, *does* run an LLM extraction step at
+write time — that's the actual feature difference between prototyping and
+production memory here, not just "persistent vs. in-memory."
+
+**3. Retrieval is keyword overlap, not embeddings.**
+`InMemoryMemoryService`'s own docstring says it outright: *"Uses keyword
+matching instead of semantic search. A search returns at most ten
+memories, the ones sharing the most words with the query."* Stripped down:
+
+```python
+words_in_query = _extract_words_lower(query)          # set of lowercase tokens
+for event in all_stored_events:
+    words_in_event = _extract_words_lower(event_text)
+    matched = sum(1 for w in words_in_query if w in words_in_event)
+    if matched:
+        scored.append((matched, MemoryEntry(...)))
+scored.sort(key=lambda x: -x[0])
+return scored[:10]
+```
+
+Plain word-overlap counting, capped at 10 results, ties broken by
+insertion order — no cosine similarity, no vector index, no notion of
+"these words are synonyms." (There's even a small fallback for accented
+text: `Bogotá` doesn't always tokenize the way you'd expect, so non-ASCII
+query words get a substring check against the lowercased raw text instead
+of a strict token match.)
+
+**Concrete consequence, observed in this project's own demo run:** when
+session #2 asked "what route and volume did I quote before," retrieval
+worked *only* because the model's own final-answer text from session #1 —
+`"...8 m³ from Bogotá to Santiago..."` — is plain natural-language text
+containing those literal words. The *tool-call* events
+(`get_freight_quote(origin=..., volume_m3=8, ...)`) were also stored, but
+they carry `FunctionCall`/`FunctionResponse` parts with no `.text`, so
+`search_memory`'s `if not words_in_event: continue` guard silently skips
+them. **The model's own conversational recap of a tool call is what's
+searchable — the structured tool arguments themselves are not.** If the
+model had answered turn 1 tersely without restating the route, session
+#2's recall would likely have come back empty. This is a real, non-obvious
+failure mode worth naming in an interview: memory quality here is
+downstream of how chatty the model's own responses were, not of what the
+tool actually computed.
+
+**4. The commit is manual by design, not an oversight.** Nothing in ADK
+auto-commits a session to memory. `cli_client.py` calls
+`add_session_to_memory()` at one chosen checkpoint (end of session 1).
+Committing every turn would be wasteful and would pollute long-term memory
+with mid-conversation churn; committing too rarely risks losing content if
+a session ends uncleanly. Production systems typically pick one of:
+session-end commit, an explicit "remember this" trigger, or a periodic
+background job.
+
+**5. "For prototyping only" is a literal, load-bearing warning, not
+boilerplate.** From the class docstring: *"This class is thread-safe,
+however, it should be used for testing and development only."* Two
+concrete gaps beyond "it's in-memory and dies on restart": no relevance
+ranking beyond literal word overlap (a paraphrased query can miss a
+memory that expressed the same idea in different words), and no cap on
+the underlying store at all — `_session_events` grows forever per user;
+the 10-result cap applies only to *search output*, never to what's
+retained. Both are exactly what a vector-DB-backed service fixes: LLM-
+driven extraction at write time, embedding similarity at read time — at
+the cost of extra latency and $ per write and per read.
+
 ### Why the client — not the agent — owns these services
 
 `Runner(agent=root_agent, session_service=..., memory_service=...)`
