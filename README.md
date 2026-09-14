@@ -120,3 +120,12 @@ Quality is verified two ways:
   produce noisy, non-actionable failures. Grading on tool trajectory instead
   catches the failures that actually matter for a pricing agent: wrong tool,
   wrong order, or no tool call at all (i.e. a fabricated price).
+
+## Author
+
+**Alfredo Guillen - Solaria Nexus**
+
+## License
+
+MIT — see [LICENSE](LICENSE). Contributions welcome, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
