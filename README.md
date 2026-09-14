@@ -50,23 +50,28 @@ python -m eval.run_evals
 
 ## Project layout
 
+Each subfolder has its own `README.md` with a technical walkthrough of
+that piece **and** an "AI Engineer interview" study section for the
+concepts it demonstrates — worth reading even if you're not touching the
+code, since together they cover the full syllabus of this course.
+
 ```
-mcp_server/
+mcp_server/    (README) synthetic pricing data + pricing exposed as MCP tools
   pricing_data.py            synthetic LatAm city catalog + pure pricing math
   freight_pricing_server.py  MCP server (FastMCP, stdio) exposing pricing as tools
-pricing_agent/
+pricing_agent/ (README) the LlmAgent + prompt + guardrails + config
   agent.py                   root_agent: LlmAgent + McpToolset + guardrail callbacks
   prompts.py                 scoped system instruction
   callbacks.py                guardrails: prompt-injection + tool-arg validation
   config.py                   env-driven settings (model, app name, log level)
-client/
+client/        (README) sessions & memory
   cli_client.py               owns SessionService/MemoryService, drives the Runner
-eval/
+eval/          (README) agentic quality: unit tests + LLM eval set
   quality_tests.py            pytest: pricing math + guardrail unit tests (no LLM)
   pricing_agent.evalset.json  ADK eval set: tool-trajectory + response-quality cases
   test_config.json            eval thresholds/match rules
   run_evals.py                runs the eval set against the live agent
-deployment/
+deployment/    (README + DEPLOY.md) prototype to production
   Dockerfile                  containerizes `adk api_server`
   DEPLOY.md                   local -> CI gates -> container -> Cloud Run
 ```
