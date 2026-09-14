@@ -11,7 +11,7 @@ Each course day maps to a specific, runnable piece of this repo:
 |---|---|---|
 | 1 | Agent introduction | `pricing_agent/agent.py`, `pricing_agent/prompts.py` — a single scoped `LlmAgent` |
 | 2 | Tools & MCP interoperability | `mcp_server/` (the pricing tool exposed over MCP) + `McpToolset` wiring in `agent.py` |
-| 3 | Context engineering — sessions & memory | `client/cli_client.py` (`--demo` mode), `load_memory` tool in `agent.py` |
+| 3 | Context engineering — sessions & memory | `client/cli_client.py` (`--demo` mode), `load_memory` tool in `agent.py`, `client/persistence.py` for `$0` durable storage |
 | 4 | **Agentic quality** | `pricing_agent/callbacks.py` (guardrails) + `eval/` (deterministic tests + LLM eval set) |
 | 5 | Prototype → production | `pricing_agent/config.py`, `deployment/` (Dockerfile, Cloud Run) |
 
@@ -41,6 +41,12 @@ python -m client.cli_client --demo
 # interactive REPL
 python -m client.cli_client
 
+# add --persist to either mode for $0 SQLite-backed sessions/memory that
+# survive across separate runs, instead of resetting every process (see
+# client/README.md's persistence section, incl. a real retrieval-quality
+# limitation this exposes)
+python -m client.cli_client --persist --demo
+
 # ADK's own dev UI for the same agent
 adk web pricing_agent
 
@@ -66,6 +72,7 @@ pricing_agent/ (README) the LlmAgent + prompt + guardrails + config
   config.py                   env-driven settings (model, app name, log level)
 client/        (README) sessions & memory
   cli_client.py               owns SessionService/MemoryService, drives the Runner
+  persistence.py              $0 SQLite-backed durable alternative (--persist)
 eval/          (README) agentic quality: unit tests + LLM eval set
   quality_tests.py            pytest: pricing math + guardrail unit tests (no LLM)
   pricing_agent.evalset.json  ADK eval set: tool-trajectory + response-quality cases

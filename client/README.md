@@ -9,6 +9,7 @@ is the whole lesson.
 | File | Role |
 |---|---|
 | `cli_client.py` | Owns both services, drives the ADK `Runner`, and (in `--demo` mode) proves session state and cross-session memory both work. |
+| `persistence.py` | `$0` durable alternative to the in-RAM services: `DatabaseSessionService` (SQLite) + a hand-rolled `SqliteMemoryService` that mirrors ADK's own keyword-overlap algorithm exactly. |
 
 ## Technical implementation
 
@@ -193,6 +194,87 @@ retained. Both are exactly what a vector-DB-backed service fixes: LLM-
 driven extraction at write time, embedding similarity at read time — at
 the cost of extra latency and $ per write and per read.
 
+### Making it durable: `client/persistence.py` ($0, SQLite)
+
+Everything above uses `InMemorySessionService`/`InMemoryMemoryService` —
+i.e. it all lives in one Python process's RAM and disappears the moment
+that process exits (see the "where does the data live" deep dive above).
+`persistence.py` is the durable counterpart, at zero infrastructure cost:
+
+```python
+def build_services(persistent: bool) -> tuple[BaseSessionService, BaseMemoryService]:
+    if not persistent:
+        return InMemorySessionService(), InMemoryMemoryService()
+
+    session_service = DatabaseSessionService(
+        db_url=f"sqlite+aiosqlite:///{DATA_DIR / 'sessions.db'}"
+    )
+    memory_service = SqliteMemoryService(DATA_DIR / "memory.db")
+    return session_service, memory_service
+```
+
+Two different persistence strategies, one per service, because ADK ships
+a production-grade solution for one of them but not the other:
+
+- **Sessions** → ADK's own `DatabaseSessionService`, pointed at a local
+  SQLite file via SQLAlchemy's async driver
+  (`sqlite+aiosqlite:///.data/sessions.db`). This is a real, ADK-maintained
+  implementation — nothing custom here, just a different `db_url` than
+  Postgres/Spanner would use. Requires `pip install "google-adk[db]"` (pulls
+  in SQLAlchemy; `aiosqlite` is already a base ADK dependency).
+- **Memory** → ADK does *not* ship a SQL-backed `BaseMemoryService` out of
+  the box — only `InMemoryMemoryService` (RAM) and two Vertex AI-hosted
+  options (billed, GCP-project-required — see the "concepts" section
+  below). So `SqliteMemoryService` in this file is a from-scratch
+  `BaseMemoryService` subclass, deliberately implementing the *exact same*
+  tokenizer and "count shared words, keep the top 10" scoring as ADK's
+  `InMemoryMemoryService` (see the deep dive above) — just against a
+  SQLite table instead of a Python `dict`. That parity is intentional: the
+  goal is to change *where the bytes live*, not *how good retrieval is*,
+  so the two backends are a fair, like-for-like comparison.
+
+Usage — either mode works with both CLI modes:
+
+```bash
+python -m client.cli_client --persist --demo   # scripted demo, SQLite-backed
+python -m client.cli_client --persist          # interactive; commits to memory on quit
+python -m client.cli_client --persist          # run again — a NEW process — same recall
+```
+
+**A live run of exactly this exposed a real, worth-knowing limitation —
+not a bug in `persistence.py`, but the literal-word-overlap algorithm it
+faithfully mirrors.** Run 1 asked for a quote (`"...from Lima to Quito"`);
+its final answer was a plain cost breakdown that never repeated the city
+names. Run 2 (a fresh process, same user) asked *"What did I ship last
+time, and to where?"* — the model correctly called `load_memory`, but with
+the query `"last shipment previous quote route"`. Checking the on-disk
+data directly confirms the write path was never the problem:
+
+```python
+>>> await SqliteMemoryService(".data/memory.db").search_memory(
+...     app_name="freight_pricing_app", user_id="cli-user",
+...     query="Lima Quito shipment")
+# -> 1 hit: "I need to ship 12 cubic meters from Lima to Quito."
+```
+
+The data was there and perfectly retrievable — but *that specific query*
+(`"last shipment previous quote route"`) shares **zero exact tokens**
+with anything stored (`"shipment"` ≠ `"ship"`, `"quote"`/`"route"` appear
+nowhere in either the user's message or the model's bullet-point answer),
+so the score was 0 for every row and `load_memory` correctly, faithfully
+returned nothing. The model then (correctly, given empty tool results)
+told the user it had no record.
+
+This is the single most important thing to take away from actually running
+this, rather than just reading about it: **verifying persistence and
+verifying retrieval quality are two different tests, and passing the first
+tells you nothing about the second.** The storage layer worked exactly as
+designed both times. Whether an answer is recallable depends entirely on
+whether *some* past utterance happens to share a literal word with
+*whatever query the model happens to generate* — which is precisely why
+production systems move to embeddings (semantic similarity, not exact
+tokens) once this failure mode starts costing real user trust.
+
 ### Why the client — not the agent — owns these services
 
 `Runner(agent=root_agent, session_service=..., memory_service=...)`
@@ -270,3 +352,30 @@ the classic "program to an interface, not an implementation" principle,
 and it's exactly what lets `deployment/DEPLOY.md` say "swap in-memory for
 database-backed with no agent code changes" and have that actually be
 true, not aspirational.
+
+**Persistence vs. retrieval quality are two separate claims — verify
+both, separately.** `persistence.py`'s own live-run finding (above) is a
+concrete, defensible interview example: "does the data survive a process
+restart" and "will the system find the right memory when asked a vaguely
+worded question" are independent properties. A system can pass the first
+test perfectly and still fail the second on the very next real query. Be
+ready to name the fix for the second problem specifically — semantic
+(embedding-based) retrieval instead of exact-token matching — and to
+explain *why* it's a different fix than "add a database" (that only ever
+solves durability, never recall quality).
+
+**The cost/complexity spectrum for durable agent memory.** In order:
+a local SQLite file ($0, what this project uses — the only real cost is
+that its retrieval is exact-keyword, as just discussed); a self-hosted
+vector DB (Postgres+pgvector, Chroma) plus an embeddings API (cents —
+embedding calls are priced per token and are far cheaper than generation
+calls); a managed RAG service (`VertexAiRagMemoryService` — real but
+modest cost, needs a GCP project with billing); and a fully managed,
+LLM-extracted memory service (`VertexAiMemoryBankService` — highest cost,
+since it runs an actual generation call on every memory commit to extract
+and deduplicate facts, on top of storage/query pricing). Knowing this
+spectrum — and that the last two require a genuinely different Google
+product (Vertex AI, with a billed GCP project) than the API-key-based
+Google AI Studio access used elsewhere in this project — is the kind of
+concrete, leveled answer that distinguishes "I've read about agent memory"
+from "I've had to actually pick one for a real budget."

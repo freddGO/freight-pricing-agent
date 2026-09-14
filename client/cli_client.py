@@ -5,21 +5,31 @@ It plays the role of the application embedding the agent: it owns the
 SessionService (short-term, per-conversation state) and MemoryService
 (long-term, cross-session recall), and drives the Runner.
 
-Two modes:
-  python -m client.cli_client            interactive REPL, single session
-  python -m client.cli_client --demo     scripted, non-interactive demo that
-                                          proves session state AND cross-
-                                          session memory both work:
-                                            1. Session #1: ask for a quote,
-                                               then a follow-up that only
-                                               makes sense with session state
-                                               ("make that express instead").
-                                            2. The session is committed to
-                                               long-term memory.
-                                            3. Session #2 (brand new session,
-                                               same user): ask the agent to
-                                               recall the earlier route using
-                                               the `load_memory` tool.
+Two modes, each of which can run against either durability backend:
+  python -m client.cli_client                  interactive REPL, single session
+  python -m client.cli_client --demo           scripted, non-interactive demo that
+                                                proves session state AND cross-
+                                                session memory both work:
+                                                  1. Session #1: ask for a quote,
+                                                     then a follow-up that only
+                                                     makes sense with session state
+                                                     ("make that express instead").
+                                                  2. The session is committed to
+                                                     long-term memory.
+                                                  3. Session #2 (brand new session,
+                                                     same user): ask the agent to
+                                                     recall the earlier route using
+                                                     the `load_memory` tool.
+
+Add --persist to either mode to back sessions/memory with SQLite files
+under .data/ instead of process RAM (see client/persistence.py and
+client/README.md's "where does the data live" section). With --persist,
+memory survives across *separate runs* of this script, not just across
+sessions within one run — try:
+
+  python -m client.cli_client --persist          # ask something, then quit
+  python -m client.cli_client --persist           # run again: a NEW process,
+                                                    # same recall via memory
 """
 
 from __future__ import annotations
@@ -29,20 +39,18 @@ import asyncio
 import logging
 import uuid
 
-from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
+from client.persistence import DATA_DIR, build_services
 from pricing_agent.agent import root_agent
 from pricing_agent.config import settings
 
 logger = logging.getLogger("pricing_agent.client")
 
 
-def _build_runner() -> tuple[Runner, InMemorySessionService, InMemoryMemoryService]:
-    session_service = InMemorySessionService()
-    memory_service = InMemoryMemoryService()
+def _build_runner(persistent: bool) -> tuple[Runner, object, object]:
+    session_service, memory_service = build_services(persistent)
     runner = Runner(
         agent=root_agent,
         app_name=settings.app_name,
@@ -65,12 +73,26 @@ async def _send(runner: Runner, user_id: str, session_id: str, text: str) -> str
     return final_text
 
 
-async def run_interactive() -> None:
-    runner, session_service, _memory_service = _build_runner()
+async def _commit_to_memory(session_service, memory_service, user_id: str, session_id: str) -> None:
+    """Re-fetches the session (to pick up events written during the
+    conversation) and commits it to long-term memory. Mirrors the same
+    "commit at a checkpoint, not every turn" policy described in
+    client/README.md.
+    """
+    committed_session = await session_service.get_session(
+        app_name=settings.app_name, user_id=user_id, session_id=session_id
+    )
+    await memory_service.add_session_to_memory(committed_session)
+
+
+async def run_interactive(persistent: bool) -> None:
+    runner, session_service, memory_service = _build_runner(persistent)
     user_id = "cli-user"
     session = await session_service.create_session(
         app_name=settings.app_name, user_id=user_id
     )
+    if persistent:
+        print(f"(persistent mode — SQLite files under {DATA_DIR})")
     print("Freight Pricing Agent — type 'quit' to exit.\n")
     while True:
         try:
@@ -84,10 +106,16 @@ async def run_interactive() -> None:
         reply = await _send(runner, user_id, session.id, text)
         print(f"agent> {reply}\n")
 
+    # Commit on the way out so a later run (same user_id) can recall this
+    # conversation via long-term memory — see _commit_to_memory's docstring.
+    await _commit_to_memory(session_service, memory_service, user_id, session.id)
 
-async def run_demo() -> None:
-    runner, session_service, memory_service = _build_runner()
+
+async def run_demo(persistent: bool) -> None:
+    runner, session_service, memory_service = _build_runner(persistent)
     user_id = "demo-user"
+    if persistent:
+        print(f"(persistent mode — SQLite files under {DATA_DIR})\n")
 
     print("=" * 70)
     print("SESSION #1 — short-term state (does the agent remember the turn?)")
@@ -109,10 +137,7 @@ async def run_demo() -> None:
     print(" that came from session state, not from re-parsing the whole chat.)\n")
 
     # Commit session #1 into long-term memory, then start a brand new session.
-    committed_session = await session_service.get_session(
-        app_name=settings.app_name, user_id=user_id, session_id=session_1.id
-    )
-    await memory_service.add_session_to_memory(committed_session)
+    await _commit_to_memory(session_service, memory_service, user_id, session_1.id)
 
     print("=" * 70)
     print("SESSION #2 — brand new session, same user: cross-session MEMORY")
@@ -136,8 +161,15 @@ def main() -> None:
     parser.add_argument(
         "--demo", action="store_true", help="Run the scripted sessions+memory demo"
     )
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="Back sessions/memory with SQLite files under .data/ instead of "
+        "process RAM, so memory survives across separate runs of this script.",
+    )
     args = parser.parse_args()
-    asyncio.run(run_demo() if args.demo else run_interactive())
+    coro = run_demo(args.persist) if args.demo else run_interactive(args.persist)
+    asyncio.run(coro)
 
 
 if __name__ == "__main__":
