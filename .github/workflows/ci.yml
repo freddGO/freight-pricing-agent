@@ -1,0 +1,58 @@
+name: CI
+
+# The two-tier quality gate described in eval/README.md, automated:
+#   1. `test` — deterministic pytest (pricing math + guardrail logic). No API
+#      key needed, runs on every push and PR, always required to pass.
+#   2. `eval` — the real agent against eval/pricing_agent.evalset.json. Needs
+#      a GOOGLE_API_KEY secret (Settings -> Secrets and variables -> Actions
+#      -> New repository secret) and only runs on pushes to main, so PRs from
+#      forks (which never get secret access) don't fail for a reason outside
+#      the contributor's control. It's non-blocking (continue-on-error) so a
+#      transient quota/API hiccup doesn't wedge the pipeline the way a real
+#      regression should.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Deterministic tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest -v
+
+  eval:
+    name: LLM-in-the-loop eval set
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ADK eval set
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: python -m eval.run_evals

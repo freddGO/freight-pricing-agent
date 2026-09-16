@@ -168,3 +168,13 @@ functions can catch). Know how to argue for running the cheap gate on
 every PR and the expensive gate before merge/deploy — this mirrors how
 most teams stage unit tests vs. integration/E2E tests for any system, LLM
 or not.
+
+This is automated, not just documented: `.github/workflows/ci.yml` runs
+`pytest` on every push and PR (no secret required, always blocking), and
+`python -m eval.run_evals` only on pushes to `main` (needs a
+`GOOGLE_API_KEY` repository secret, and is `continue-on-error: true` so a
+transient API/quota hiccup doesn't wedge the pipeline the way a genuine
+tool-trajectory regression should). Splitting the two jobs like this —
+cheap-and-blocking vs. expensive-and-advisory — is itself a small,
+concrete answer to "how would you stage CI for a repo that mixes free
+deterministic tests with paid LLM calls."

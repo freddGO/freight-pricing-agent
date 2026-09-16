@@ -1,5 +1,7 @@
 # Freight Pricing Agent — Kaggle "5-Day Agents" Capstone
 
+[![CI](https://github.com/freddGO/freight-pricing-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/freddGO/freight-pricing-agent/actions/workflows/ci.yml)
+
 A freight-logistics pricing agent built with **Google ADK** + **Gemini**,
 used as a wrap-up project for Kaggle's *5-Day Agents* course. Ask it for a
 freight quote (origin, destination, cargo volume in m3) and it returns a
