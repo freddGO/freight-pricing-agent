@@ -40,7 +40,7 @@ freight_pricing_toolset = McpToolset(
             args=["-m", "mcp_server.freight_pricing_server"],
             cwd=str(PROJECT_ROOT),
         ),
-        timeout=30.0,
+        timeout=45.0,
     ),
 )
 

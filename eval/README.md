@@ -101,6 +101,39 @@ noise, not signal, for a tool-driven agent like this one. The lesson kept
 here on purpose: **grade what actually indicates correctness for your
 agent's job (right tool, right order), not surface-level text similarity.**
 
+### The CI concurrency bug (`run_evals.py`)
+
+A second real failure showed up only after wiring the eval job into
+`.github/workflows/ci.yml` — it never happened on a local run. ADK's
+`AgentEvaluator.evaluate()` runs the eval cases within a set concurrently
+(`InferenceConfig`'s default `parallelism` is 4). Each case's agent spawns
+its *own* MCP subprocess (`pricing_agent/agent.py`'s `McpToolset` launches
+`mcp_server/freight_pricing_server.py` fresh, per agent instance), so
+4-way parallelism means up to 4 concurrent subprocess spawns plus 4
+concurrent Gemini calls all competing for CPU. That's fine on a dev
+laptop; GitHub Actions' shared 2-vCPU runners are noisier, and under that
+contention one MCP connection attempt blew past even a 30-second timeout
+— a `TimeoutError` with no actual bug in the agent, tools, or eval cases.
+
+`run_evals.py` fixes the root cause rather than just raising the timeout
+further: instead of calling `AgentEvaluator.evaluate()` once on the whole
+eval set (letting ADK parallelize internally), it loads the eval set,
+splits it into one single-case `EvalSet` per case, and calls
+`AgentEvaluator.evaluate_eval_set()` **sequentially**, once per case.
+With only one case per call there's nothing left for ADK to parallelize
+— MCP subprocesses are never alive more than one at a time, so the
+contention that caused the timeout can't happen at all, on any runner.
+The MCP timeout was also bumped 30s → 45s for extra headroom, but that's
+the secondary fix, not the one actually eliminating the flakiness.
+
+The lesson worth restating in an interview: **when infra flakes under
+concurrency, prefer removing the concurrency at its source over inflating
+a timeout to paper over it.** A bigger timeout is a bet that contention
+stays below some bound forever; running one at a time is a guarantee it
+never occurs, at the honest cost of a slower CI job (five tiny cases run
+sequentially in ~50s here — a trade very much worth making for a gate
+that would otherwise fail nondeterministically).
+
 ## Concepts to study for an AI Engineer interview
 
 **Testing vs. evaluation — know the line.** "Testing" (this project's
